@@ -172,9 +172,9 @@
 
     <rect fill="#282c34" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1578" height="1048.4" rx="8"/><text class="terminal-3912012047-title" fill="#abb2bf" text-anchor="middle" x="789" y="27">pi&#160;&#160;+&#160;&#160;claude-subagent&#160;&#160;—&#160;&#160;alt+a&#160;manager</text>
             <g transform="translate(26,22)">
-            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
-            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
-            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            
+            
+            
             </g>
         
     <g transform="translate(9, 41)" clip-path="url(#terminal-3912012047-clip-terminal)">
