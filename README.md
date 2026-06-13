@@ -14,43 +14,14 @@ The design deliberately mirrors Claude Code's subagent model rather than pi's bu
 Spawning two background teammates from a single prompt — each runs in its own long-lived
 pi process, reports back inline when done, and is tracked live in the bottom widget:
 
-```text
-› Spawn two background general-purpose agents at once: name the first 'counter' to
-  count the lines in index.ts, and the second 'lister' to list the markdown files.
+![Spawning two background teammates, tracked in the live widget](assets/demo.png)
 
-● general-purpose (Count lines in index.ts)
-⎿  teammate @counter — replies arrive as messages; follow up with send_message (alt+a manages)
+`alt+a` opens the agent manager to dispatch, watch, or kill agents. When both finish, their
+reports land inline and the roster shows each one idle:
 
-● general-purpose (List all markdown files)
-⎿  teammate @lister — replies arrive as messages; follow up with send_message (alt+a manages)
+![The alt+a agent manager over the completed results](assets/manager.png)
 
-  Both agents are running in the background. Their results arrive as messages when
-  they finish; I can steer either one with send_message.
-
-● @counter (general-purpose) · 1 tool use · 3.9k tokens · 31s
-   The file index.ts contains exactly 3005 lines.
-
-● @lister (general-purpose) · 3 tool uses · 27.0k tokens · 1m 1s
-   Found 295 total .md files. The project-level ones are README.md, table.md, demo.md, …
-
-⠙ 2 agents · alt+a manages
-├ @counter (Count lines in index.ts) · 1 tool use · 3.9k tokens · 1% ctx · 1m 1s · idle
-└ @lister (List all markdown files) · 3 tool uses · 27.0k tokens · 3% ctx · 1m 1s · idle
-```
-
-`alt+a` opens the agent manager to dispatch, watch, or kill agents:
-
-```text
- Agents (2)
-
- → Dispatch new agent…
-   @counter (Count lines in index.ts) · idle · 1m 4s
-   @lister (List all markdown files) · idle · 1m 4s
-   Kill all
-   Close
-
- ↑↓ navigate   enter select   escape/ctrl+c cancel
-```
+> Captured from a live `pi` session running this extension (model: a local Qwen3.6-27B).
 
 ## How it works
 
