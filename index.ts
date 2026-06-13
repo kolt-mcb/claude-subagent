@@ -958,6 +958,32 @@ class RpcChild {
 		this.armTimer(); // question answered — the run clock starts again
 	}
 
+	/**
+	 * Inject a steering message into the in-flight run. pi folds it in at the
+	 * next tool-call boundary, redirecting the current turn without ending it —
+	 * the run resolves once, with the steered output. No-op if nothing is
+	 * running (a non-working session has no turn to steer). Returns false when
+	 * there's no live run to steer, so the caller can fall back.
+	 */
+	steer(message: string): boolean {
+		if (!this.alive || !this.run) return false;
+		this.send({ type: "steer", message });
+		this.armTimer(); // fresh intent — give the redirected work a full clock
+		return true;
+	}
+
+	/**
+	 * Hard-stop the in-flight turn: kill any running bash first so a long
+	 * command can't hold the turn open, then abort. pi emits agent_end, which
+	 * settles the current run; the caller's settle handler then drains the
+	 * queue, running any follow-up as a fresh prompt.
+	 */
+	abortTurn(): void {
+		if (!this.alive || !this.run) return;
+		this.send({ type: "abort_bash" });
+		this.send({ type: "abort" });
+	}
+
 	/** Kill the child. A pending run settles with `reason` (or an exit error). */
 	kill(reason?: string): void {
 		if (this.run && reason) this.run.abortReason = reason;
@@ -1852,6 +1878,10 @@ Usage notes:
 				type: "boolean",
 				description: "Set to true to shut the agent down instead of messaging it.",
 			},
+			interrupt: {
+				type: "boolean",
+				description: "Only affects an agent that is mid-turn. Default false: the message is steered into the current turn — the agent folds it in at its next step and redirects without losing context (use for 'also do X', 'be quicker', 'focus on Y'). Set true to hard-stop instead: the current turn (and any running command) is aborted, then your message runs as a fresh prompt (use for 'stop, you're stuck', 'drop that and do this').",
+			},
 		},
 		required: ["name"],
 		additionalProperties: false,
@@ -1862,24 +1892,25 @@ Usage notes:
 		label: "SendMessage",
 		description: `Send a follow-up message to a running agent — a teammate (spawned via the agent tool's name parameter) or a live background agent — or shut one down.
 
-- In-process teammates and background agents: the message continues their persistent conversation; the reply arrives as a message from @name. If the agent is mid-turn, the message is queued. If the agent is blocked on an ask_user question, the message answers that question and the turn resumes.
+- In-process teammates and background agents: the message continues their persistent conversation; the reply arrives as a message from @name. If the agent is mid-turn, the message steers the current turn by default — the agent folds it in at its next step and redirects without losing context (pass interrupt: true to instead abort the turn and run the message as a fresh prompt). If the agent is blocked on an ask_user question, the message answers that question and the turn resumes.
 - Pane teammates: the message is typed into their tmux pane.
 - shutdown: true ends the agent instead of messaging it. Use it to approve a teammate's shutdown request; sending follow-up work instead implicitly declines the request.`,
 		parameters: sendMessageParameters as never,
 		executionMode: "parallel",
 
 		renderCall(args, theme) {
-			const a = args as { name?: string; message?: string; shutdown?: boolean };
+			const a = args as { name?: string; message?: string; shutdown?: boolean; interrupt?: boolean };
 			const name = sanitizeTeammateName(a.name ?? "?");
 			const session = sessions.get(name);
 			const label = typeLabel(theme, `@${name}`, session?.color);
 			if (a.shutdown === true) return new TruncatedText(`${theme.fg("toolTitle", theme.bold("send_message"))} ${label} ${theme.fg("warning", "shutdown")}`, 0, 0);
+			if (a.interrupt === true) return new TruncatedText(`${theme.fg("toolTitle", theme.bold("send_message"))} ${label} ${theme.fg("warning", "interrupt")} ${theme.fg("dim", (a.message ?? "").replace(/\s+/g, " ").trim())}`, 0, 0);
 			const preview = (a.message ?? "").replace(/\s+/g, " ").trim();
 			return new TruncatedText(`${theme.fg("toolTitle", theme.bold("send_message"))} ${label} ${theme.fg("dim", preview)}`, 0, 0);
 		},
 
 		async execute(_id, rawParams, _signal, _onUpdate, ctx) {
-			const params = rawParams as { name: string; message?: string; shutdown?: boolean };
+			const params = rawParams as { name: string; message?: string; shutdown?: boolean; interrupt?: boolean };
 			const name = sanitizeTeammateName(params.name);
 
 			const session = sessions.get(name);
@@ -1904,9 +1935,22 @@ Usage notes:
 					return { content: [{ type: "text", text: `'@${name}' had a pending question; your message was delivered as the answer and its turn resumes. Its reply will arrive as a message.` }], details: { name } };
 				}
 				if (session.state === "working") {
-					session.queue.push(params.message);
-					updateWidget(ctx);
-					return { content: [{ type: "text", text: `'@${name}' is mid-turn; message queued (position ${session.queue.length}). Its reply will arrive as a message.` }], details: { name, queued: true } };
+					if (params.interrupt === true) {
+						// Hard stop: queue the message, then abort the turn. Aborting
+						// settles the current run, whose settle handler drains the
+						// queue and runs this message as a fresh prompt.
+						session.queue.push(params.message);
+						session.child.abortTurn();
+						updateWidget(ctx);
+						return { content: [{ type: "text", text: `'@${name}' is mid-turn; aborting its current work and running your message as a fresh prompt. Its reply will arrive as a message.` }], details: { name, queued: true } };
+					}
+					// Default: steer into the live turn — the agent folds the message
+					// in at its next step and keeps its context.
+					if (session.child.steer(params.message)) {
+						updateWidget(ctx);
+						return { content: [{ type: "text", text: `Steered into '@${name}'s current turn; it will fold your message in and redirect without losing context. Its reply arrives as a message when the turn ends.` }], details: { name } };
+					}
+					// No live run to steer (state raced to idle) — fall through to a fresh turn below.
 				}
 				if (!session.child.alive) {
 					throw new Error(`'@${name}' has exited and can no longer be messaged.`);
