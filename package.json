@@ -4,6 +4,10 @@
 	"description": "Claude Code-style Agent (Task) tool for pi: minimal purpose-built subagent prompts, fresh context, no nesting.",
 	"type": "module",
 	"main": "index.ts",
+	"scripts": {
+		"test": "node test/run.mjs",
+		"typecheck": "tsc --noEmit --target es2022 --module esnext --moduleResolution bundler --skipLibCheck --strict index.ts"
+	},
 	"pi": {
 		"extensions": ["./index.ts"]
 	}

@@ -33,7 +33,7 @@
  * report is delivered back to the session as a custom message when the child
  * completes (pi.sendMessage with triggerTurn). Reports landing close together
  * smart-join into one batch (one wake-up turn for N completions). Users can
- * also dispatch background agents themselves via /dispatch or the alt+a
+ * also dispatch background agents themselves via /dispatch or the /agents
  * manager, watch any agent's conversation in a live-following transcript
  * overlay (x x stops it), and read each agent's context utilization in the
  * widget (the child reports its own percent via get_session_stats).
@@ -44,13 +44,31 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, TruncatedText, hyperlink, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	AssistantMessageComponent,
+	CustomEditor,
+	ToolExecutionComponent,
+	UserMessageComponent,
+	getMarkdownTheme,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, TruncatedText, hyperlink, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 
 const CHILD_ENV = "CLAUDE_STYLE_SUBAGENT_CHILD";
-const WIDGET_KEY = "claude-subagent-jobs";
-const RESULT_MESSAGE_TYPE = "claude-subagent-result";
-const TEAMMATE_MESSAGE_TYPE = "claude-subagent-teammate-message";
+const WIDGET_KEY = "subagent-jobs";
+const PREVIEW_WIDGET_KEY = "subagent-preview";
+/**
+ * Repaint cadence for the roster. Child progress events are bursty — during a
+ * long bash call none arrive at all — so without a heartbeat the spinner, the
+ * elapsed-time column and the "doing" line all freeze mid-run.
+ */
+const WIDGET_TICK_MS = 150;
+/** Ceiling on transcript-preview height so the editor never gets pushed off screen. */
+const PREVIEW_MAX_ROWS = 16;
+const RESULT_MESSAGE_TYPE = "agent-result";
+const TEAMMATE_MESSAGE_TYPE = "teammate-message";
 const RECENT_TOOLS_LIMIT = 5;
 const SESSIONS_DIR = path.join(os.homedir(), ".claude-subagent", "sessions");
 const TEAMMATES_DIR = path.join(os.homedir(), ".claude-subagent", "teammates");
@@ -63,6 +81,15 @@ const REPORT_WATCH_EXPIRY_MS = 4 * 60 * 60 * 1000;
 const DEFAULT_CHILD_TIMEOUT_MS = 10 * 60 * 1000;
 const MIN_CHILD_TIMEOUT_MS = 10 * 1000;
 const MAX_CHILD_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+/**
+ * A child that emits no event for this long while a run is pending is treated
+ * as stalled: the run settles with whatever it produced and the child is
+ * killed. This is deliberately independent of the run timeout, which steer()
+ * re-arms — otherwise a parent polling a hung child would postpone its own
+ * watchdog forever and the run would never settle at all.
+ */
+const CHILD_STALL_MS = 90 * 1000;
+const CHILD_STALL_POLL_MS = 15 * 1000;
 /** Smart join: background reports finishing close together deliver as one turn. */
 const REPORT_JOIN_DEBOUNCE_MS = 2000;
 const REPORT_JOIN_MAX_MS = 10 * 1000;
@@ -576,7 +603,7 @@ function sessionLink(theme: AnyTheme, sessionFile: string): LinkLine {
 // ---------------------------------------------------------------------------
 // Unified session roster: every live RPC child — synchronous subagents,
 // background agents, and in-process teammates — is one AgentSession. The
-// widget and the alt+a manager render from this registry. (Pane teammates
+// widget and the /agents manager render from this registry. (Pane teammates
 // live in tmux and keep their own registry below.)
 // ---------------------------------------------------------------------------
 
@@ -597,6 +624,8 @@ interface AgentSession {
 	queue: string[];
 	pendingUi?: UiRequest;
 	lastReply?: string;
+	/** When a content-free status ping was last accepted, for rate limiting. */
+	lastStatusPingAt?: number;
 	/** Teammate asked to be shut down; awaiting lead approval. */
 	shutdownRequested: boolean;
 	/** Shutdown decided; tear down when the current run settles. */
@@ -605,6 +634,24 @@ interface AgentSession {
 }
 
 const sessions = new Map<string, AgentSession>();
+
+/** How often a working agent may be asked for a progress report. */
+const STATUS_PING_COOLDOWN_MS = 60 * 1000;
+const STATUS_PING_RE =
+	/\b(status|progress|findings?|results?|summar(y|ise|ize)|report|update|how (are|is|are things)|any(thing)? (yet|so far)|so far|preliminary|what have you|done yet|finished)\b/i;
+
+/**
+ * A message that asks for a progress report without adding work. These are the
+ * pings that turn a still-researching agent into a fabricating one: the
+ * question presupposes findings, so an agent that has gathered nothing yet
+ * answers with invention rather than "nothing yet".
+ */
+function isStatusPing(message: string): boolean {
+	const m = message.trim();
+	if (m.length > 200) return false; // long enough to be carrying real instruction
+	if (/[/\\]|https?:|`|\.(ts|js|mjs|c|h|py|md|go|rs|json)\b/i.test(m)) return false; // names a file, path, or symbol
+	return STATUS_PING_RE.test(m);
+}
 
 function uniqueSessionName(base: string): string {
 	const slug = base.replace(/^@/, "").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "agent";
@@ -630,54 +677,356 @@ function formatDuration(ms: number): string {
 	return `${Math.floor(s / 60)}m${s % 60 ? ` ${s % 60}s` : ""}`;
 }
 
+/**
+ * Compact age for the roster's right column: one unit, no spaces.
+ * formatDuration only counts minutes, so a four-hour agent reads "240m" there.
+ */
+function formatAge(ms: number): string {
+	const s = Math.round(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m`;
+	const h = Math.floor(m / 60);
+	if (h < 24) return `${h}h`;
+	return `${Math.floor(h / 24)}d`;
+}
+
+/** Like formatDuration but space-free ("3m22s") so it sits in one table cell. */
+function compactDuration(ms: number): string {
+	const s = Math.round(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const r = s % 60;
+	return r ? `${m}m${r}s` : `${m}m`;
+}
+
+// ---------------------------------------------------------------------------
+// AgentTable: the roster widget rendered as fit-width aligned columns. All
+// rows are laid out together so every column auto-sizes to its widest cell
+// and lines up; the two elastic columns (description, doing) share whatever
+// width is left and truncate to keep the whole thing inline on one row each.
+// ---------------------------------------------------------------------------
+
+
+/** Display groups, in the order they are shown. Mirrors sortedSessions(). */
+const STATE_GROUPS: { state: SessionState; label: string }[] = [
+	{ state: "needs-input", label: "Needs input" },
+	{ state: "working", label: "Working" },
+	{ state: "idle", label: "Idle" },
+	{ state: "done", label: "Completed" },
+	{ state: "failed", label: "Failed" },
+];
+
+/**
+ * The agent roster, grouped by state: one row per agent carrying a state icon,
+ * its name, a one-line summary of what it is doing, and its age. Compact stats
+ * ride along dimmed before the age — Claude's view omits them, but they are the
+ * reason to look at this list at all.
+ */
+class AgentTable {
+	private readonly theme: AnyTheme;
+	private readonly list: AgentSession[];
+	private readonly selected: number | undefined;
+
+	constructor(list: AgentSession[], theme: AnyTheme, selected?: number) {
+		this.theme = theme;
+		this.list = list;
+		this.selected = selected;
+	}
+
+	invalidate(): void {}
+
+	/** Leading glyph: animated while working, coloured by outcome once settled. */
+	private icon(s: AgentSession): string {
+		const theme = this.theme;
+		switch (s.state) {
+			case "working":
+				return theme.fg("accent", spinnerFrame(clockSpinner()));
+			case "needs-input":
+				return theme.fg("warning", "✻");
+			case "idle":
+				return theme.fg("dim", s.child.alive ? "✻" : "∙");
+			case "done":
+				return theme.fg("success", "●");
+			case "failed":
+				return theme.fg("error", "✗");
+		}
+	}
+
+	/** One-line status: what it is doing, what it is asking, or how it ended. */
+	private summary(s: AgentSession): string {
+		const theme = this.theme;
+		switch (s.state) {
+			case "needs-input":
+				return theme.fg("warning", s.pendingUi?.title ?? "waiting for an answer");
+			case "working":
+				return theme.fg("dim", s.currentTool ?? s.description ?? "working…");
+			case "idle":
+				if (s.shutdownRequested) return theme.fg("warning", "requests shutdown");
+				return theme.fg("dim", s.queue.length ? `idle · ${s.queue.length} queued` : (s.lastReply?.split("\n")[0] ?? "idle"));
+			case "done":
+				return theme.fg("dim", s.lastReply?.split("\n")[0] ?? "done");
+			case "failed":
+				return theme.fg("error", "failed");
+		}
+	}
+
+	private stats(s: AgentSession): string {
+		const bits: string[] = [];
+		if (s.child.toolCount > 0) bits.push(`${s.child.toolCount}t`);
+		if (s.child.tokens > 0) bits.push(formatTokens(s.child.tokens));
+		if (s.child.contextPercent !== undefined) bits.push(`${s.child.contextPercent}%`);
+		return bits.join(" ");
+	}
+
+	render(width: number): string[] {
+		const theme = this.theme;
+		const now = Date.now();
+		const pad = (v: string, w: number) => {
+			const t = truncateToWidth(v, w, "…", true);
+			return t + " ".repeat(Math.max(0, w - visibleWidth(t)));
+		};
+		const padLeftOf = (v: string, w: number) => " ".repeat(Math.max(0, w - visibleWidth(v))) + truncateToWidth(v, w);
+
+		const nameW = Math.min(28, Math.max(5, ...this.list.map((s) => visibleWidth(sessionLabel(s)))));
+		const statsW = Math.max(5, ...this.list.map((s) => visibleWidth(this.stats(s))));
+		const ageW = Math.max(4, ...this.list.map((s) => visibleWidth(formatAge(now - s.startedAt))));
+		// marker(3) + icon(2) + name + gap + summary + gap + stats + gap + age
+		const frame = 3 + 2 + nameW + 2 + 2 + statsW + 2 + ageW;
+		// Size the summary to the longest one actually present rather than to the
+		// leftover width, so stats and age sit beside the text instead of being
+		// flung to the right edge behind a field of padding.
+		const natural = Math.max(visibleWidth("doing"), ...this.list.map((s) => visibleWidth(this.summary(s))));
+		const summaryW = Math.max(10, Math.min(natural, width - frame));
+
+		const row = (marker: string, icon: string, name: string, summary: string, stats: string, age: string) =>
+			truncateToWidth(
+				`${marker}${icon} ${pad(name, nameW)}  ${pad(summary, summaryW)}  ${padLeftOf(stats, statsW)}  ${padLeftOf(age, ageW)}`,
+				width,
+			).replace(/\s+$/, "");
+
+		const dim = (v: string) => theme.fg("dim", v);
+		const out: string[] = [row("   ", " ", dim("agent"), dim("doing"), dim("usage"), dim("time"))];
+		for (const group of STATE_GROUPS) {
+			const members = this.list.filter((s) => s.state === group.state);
+			if (members.length === 0) continue;
+			out.push(dim(` ${group.label}`));
+			for (const s of members) {
+				const i = this.list.indexOf(s);
+				out.push(
+					row(
+						i === this.selected ? theme.fg("accent", " ❯ ") : "   ",
+						this.icon(s),
+						i === this.selected ? theme.bold(sessionLabel(s)) : typeLabel(theme, sessionLabel(s), s.color),
+						this.summary(s),
+						dim(this.stats(s)),
+						dim(formatAge(now - s.startedAt)),
+					),
+				);
+			}
+		}
+		return out;
+	}
+}
+
+/**
+ * Render a child's session.jsonl using pi's own message components, so a
+ * subagent transcript reads exactly like the root conversation — same user and
+ * assistant styling, same collapsible tool rows — instead of a markdown
+ * approximation of it. Both the inline preview and the full-screen viewer go
+ * through here so they can never drift apart.
+ */
+interface TranscriptOptions {
+	tui: TUI;
+	cwd: string;
+	hideThinking?: boolean;
+	expanded?: boolean;
+}
+
+function buildTranscriptComponents(sessionFile: string, opts: TranscriptOptions): Component[] {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(sessionFile, "utf-8");
+	} catch {
+		return [];
+	}
+	const theme = getMarkdownTheme();
+	const out: Component[] = [];
+	// A tool result arrives as its own entry; hand it to the call's component so
+	// the pair renders as one collapsible row, the way the root chat does it.
+	const pending = new Map<string, ToolExecutionComponent>();
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		let entry: { type?: string; message?: Record<string, unknown> };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry.type !== "message" || !entry.message) continue;
+		const m = entry.message as {
+			role?: string;
+			content?: unknown;
+			toolCallId?: string;
+			isError?: boolean;
+		};
+		if (m.role === "user") {
+			const text = extractText(m.content).trim();
+			if (text) out.push(new UserMessageComponent(text, theme));
+		} else if (m.role === "assistant") {
+			out.push(new AssistantMessageComponent(m as never, opts.hideThinking ?? false, theme));
+			const blocks = Array.isArray(m.content) ? (m.content as Array<{ type?: string; id?: string; name?: string; arguments?: unknown }>) : [];
+			for (const b of blocks) {
+				if (b.type !== "toolCall") continue;
+				const comp = new ToolExecutionComponent(b.name ?? "tool", b.id ?? "", b.arguments, undefined, undefined, opts.tui, opts.cwd);
+				comp.setExpanded(opts.expanded ?? false);
+				out.push(comp);
+				if (b.id) pending.set(b.id, comp);
+			}
+		} else if (m.role === "toolResult") {
+			const comp = m.toolCallId ? pending.get(m.toolCallId) : undefined;
+			const content = (Array.isArray(m.content) ? m.content : []) as Array<{ type: "text"; text: string }>;
+			comp?.updateResult({ content, isError: Boolean(m.isError) });
+			if (m.toolCallId) pending.delete(m.toolCallId);
+		}
+	}
+	return out;
+}
+
+/** Flatten a transcript to display lines, with a blank line between messages. */
+function transcriptLines(sessionFile: string, width: number, opts: TranscriptOptions): string[] {
+	const components = buildTranscriptComponents(sessionFile, opts);
+	const lines: string[] = [];
+	for (const c of components) {
+		if (lines.length) lines.push("");
+		lines.push(...c.render(width));
+	}
+	return lines;
+}
+
+/**
+ * Rebuilding every component on each frame is wasteful when the widget
+ * re-renders on a spinner tick, so cache per file+width and invalidate on the
+ * file's size/mtime.
+ */
+const transcriptCache = new Map<string, { stamp: string; width: number; lines: string[] }>();
+
+function transcriptLinesCached(sessionFile: string, width: number, opts: TranscriptOptions): string[] {
+	let stamp = "missing";
+	try {
+		const st = fs.statSync(sessionFile);
+		stamp = `${st.size}:${st.mtimeMs}:${opts.hideThinking ? 1 : 0}:${opts.expanded ? 1 : 0}`;
+	} catch {}
+	const hit = transcriptCache.get(sessionFile);
+	if (hit && hit.stamp === stamp && hit.width === width) return hit.lines;
+	const lines = transcriptLines(sessionFile, width, opts);
+	transcriptCache.set(sessionFile, { stamp, width, lines });
+	return lines;
+}
+
+/**
+ * Index into sortedSessions() of the agent being browsed from the editor, or
+ * null when the editor is in normal typing mode. Browsing is entered with ↓ on
+ * an empty editor and shows the selected agent's live transcript above it.
+ */
+let browseIndex: number | null = null;
+
+/** Clamp the browse selection to the roster; drop it when nothing is left. */
+function normalizeBrowse(): AgentSession | undefined {
+	const list = sortedSessions();
+	if (browseIndex === null) return undefined;
+	if (list.length === 0) {
+		browseIndex = null;
+		return undefined;
+	}
+	browseIndex = Math.max(0, Math.min(browseIndex, list.length - 1));
+	return list[browseIndex];
+}
+
+/** Heartbeat that repaints the roster between child events. */
+let widgetTicker: ReturnType<typeof setInterval> | undefined;
+/**
+ * The TUI handed to the widget factory. The heartbeat asks it for a repaint
+ * rather than re-registering the widgets: setWidget() rebuilds both widget
+ * containers, and doing that several times a second makes the rendered buffer
+ * length wobble. While the user is scrolled back the visible slice is clamped
+ * to that length, so a wobbling buffer drags the viewport out from under them
+ * and the mouse wheel appears to stop working.
+ */
+let widgetTui: TUI | undefined;
+
+function stopWidgetTicker(): void {
+	if (widgetTicker) clearInterval(widgetTicker);
+	widgetTicker = undefined;
+}
+
+/** Tick only while something is actually moving; a settled roster is static. */
+function syncWidgetTicker(): void {
+	const live = [...sessions.values()].some((s) => s.state === "working" || s.state === "needs-input");
+	if (!live) return stopWidgetTicker();
+	if (widgetTicker) return;
+	widgetTicker = setInterval(() => widgetTui?.requestRender(), WIDGET_TICK_MS);
+	widgetTicker.unref?.();
+}
+
 function updateWidget(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 	if (sessions.size === 0) {
+		browseIndex = null;
+		stopWidgetTicker();
+		widgetTui = undefined;
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
+		ctx.ui.setWidget(PREVIEW_WIDGET_KEY, undefined);
 		return;
 	}
+	syncWidgetTicker();
 	const list = sortedSessions();
-	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
+	const selected = normalizeBrowse();
+	// The roster sits below the editor so it reads as a status strip attached
+	// to the input, not as another message in the scrollback.
+	ctx.ui.setWidget(
+		WIDGET_KEY,
+		(tui, theme) => {
+			widgetTui = tui;
+			const c = new Container();
+			const needsInput = list.filter((s) => s.state === "needs-input").length;
+			const anyBusy = list.some((s) => s.state === "working");
+			const glyph = needsInput > 0 ? theme.fg("warning", "?") : anyBusy ? theme.fg("accent", spinnerFrame(clockSpinner())) : theme.fg("dim", "●");
+			const inputNote = needsInput > 0 ? `${theme.fg("warning", `${needsInput} need${needsInput === 1 ? "s" : ""} input`)} ${theme.fg("dim", "·")} ` : "";
+			const hint = browseIndex === null ? "↓ browse" : "↑/↓ select · enter transcript · → actions · esc exits";
+			c.addChild(new TruncatedText(`${glyph} ${theme.bold(String(list.length))} agent${list.length === 1 ? "" : "s"} ${theme.fg("dim", "·")} ${inputNote}${theme.fg("dim", hint)}`, 1, 0));
+			c.addChild(new AgentTable(list, theme, browseIndex ?? undefined));
+			return c;
+		},
+		{ placement: "belowEditor" },
+	);
+	updatePreviewWidget(ctx, selected);
+}
+
+/** Transcript tail of the browsed agent, rendered above the editor. */
+function updatePreviewWidget(ctx: ExtensionContext, selected: AgentSession | undefined): void {
+	if (!ctx.hasUI) return;
+	if (!selected) {
+		ctx.ui.setWidget(PREVIEW_WIDGET_KEY, undefined);
+		return;
+	}
+	ctx.ui.setWidget(PREVIEW_WIDGET_KEY, (tui, theme) => {
 		const c = new Container();
-		const needsInput = list.filter((s) => s.state === "needs-input").length;
-		const anyBusy = list.some((s) => s.state === "working");
-		const glyph = needsInput > 0 ? theme.fg("warning", "?") : anyBusy ? theme.fg("accent", spinnerFrame(clockSpinner())) : theme.fg("dim", "●");
-		const inputNote = needsInput > 0 ? `${theme.fg("warning", `${needsInput} need${needsInput === 1 ? "s" : ""} input`)} ${theme.fg("dim", "·")} ` : "";
-		c.addChild(new TruncatedText(`${glyph} ${theme.bold(String(list.length))} agent${list.length === 1 ? "" : "s"} ${theme.fg("dim", "·")} ${inputNote}${theme.fg("dim", "alt+a manages")}`, 1, 0));
-		for (let i = 0; i < list.length; i++) {
-			const s = list[i]!;
-			const stats = statsSuffix(theme, s.child.toolCount, s.child.tokens);
-			let stateNote: string;
-			switch (s.state) {
-				case "needs-input":
-					stateNote = theme.fg("warning", ` · needs input: ${s.pendingUi?.title ?? "question"}`);
-					break;
-				case "working":
-					stateNote = theme.fg("dim", ` · ${s.currentTool ?? "working…"}`);
-					break;
-				case "idle":
-					stateNote = s.shutdownRequested
-						? theme.fg("warning", " · requests shutdown")
-						: theme.fg("dim", ` · idle${s.queue.length ? ` (${s.queue.length} queued)` : ""}`);
-					break;
-				case "done":
-					stateNote = theme.fg("dim", " · done");
-					break;
-				case "failed":
-					stateNote = theme.fg("error", " · failed");
-					break;
-			}
-			const branch = theme.fg("dim", i === list.length - 1 ? "└" : "├");
-			const turns = s.child.turns > 0 ? theme.fg("dim", ` · ↻${s.child.turns}`) : "";
-			const elapsed = theme.fg("dim", ` · ${formatDuration(Date.now() - s.startedAt)}`);
-			c.addChild(
-				new TruncatedText(
-					`${branch} ${typeLabel(theme, sessionLabel(s), s.color)} ${theme.fg("dim", `(${s.description})`)}${stats}${turns}${contextBadge(theme, s.child.contextPercent)}${elapsed}${stateNote}`,
-					1,
-					0,
-				),
-			);
+		const stats = `${selected.child.toolCount} tool use${selected.child.toolCount === 1 ? "" : "s"} · ${formatTokens(selected.child.tokens)} tokens`;
+		c.addChild(new TruncatedText(`${theme.fg("accent", "❯")} ${theme.bold(sessionLabel(selected))} ${theme.fg("dim", `— ${selected.state} · ${stats}`)}`, 1, 0));
+		const width = Math.max(20, (tui.terminal.columns || 80) - 2);
+		// Thinking blocks are hidden here only because the preview is height
+		// constrained; the full viewer shows them.
+		const body = transcriptLinesCached(selected.sessionFile, width, { tui, cwd: ctx.cwd, hideThinking: true });
+		if (body.length === 0) {
+			c.addChild(new TruncatedText(theme.fg("muted", "   (no messages yet)"), 0, 0));
+			return c;
 		}
+		// Show the tail: the newest exchange is what the user scrolled here for.
+		const rows = Math.max(6, Math.min(PREVIEW_MAX_ROWS, Math.floor((tui.terminal.rows || 30) * 0.4)));
+		const hidden = Math.max(0, body.length - rows);
+		if (hidden > 0) c.addChild(new TruncatedText(theme.fg("muted", `   ─── ↑ ${hidden} earlier line${hidden === 1 ? "" : "s"} (enter opens full transcript) ───`), 0, 0));
+		for (const line of body.slice(hidden)) c.addChild(new TruncatedText(line, 0, 0));
 		return c;
 	});
 }
@@ -808,6 +1157,9 @@ You are teammate '@${name}', working alongside the main pi session on assigned t
 - Each reply you produce is relayed to the main session as a message from @${name}; your final message each turn IS your report for that turn.
 - You may receive follow-up messages that continue this same conversation — retain and build on your context.
 - Stay focused on your assigned work; be concise in replies.
+- Never announce work instead of doing it. A turn that ends with "I'll read those files" and no tool calls is relayed to the lead as your report for that turn — make the tool calls in the same turn.
+- The lead may ask what you have found before you have finished, sometimes in wording that assumes you already have findings. Answer from your tool output only. If you have not gathered evidence yet, say exactly that and what you are doing — never reconstruct file contents, line numbers, or code you have not actually read. An honest "nothing yet" is useful; an invented finding poisons the lead's work and is worse than silence.
+- Every file path, line number, and code snippet in your report must come from something you read this session. If you are recalling rather than quoting, say so.
 - When your work is fully complete and you expect no further follow-ups, you may request shutdown by ending your reply with the marker SHUTDOWN_REQUEST on its own line. The lead decides whether to approve; until then, remain available.`;
 }
 
@@ -832,6 +1184,12 @@ interface RunOutcome {
 	error?: string;
 	/** Args.result of the child's structured_output call, if it made one. */
 	structuredOutput?: unknown;
+	/**
+	 * Set when the run was cut short by the stall watchdog rather than by the
+	 * child finishing. Any finalText here is partial: whatever the child had
+	 * emitted before it went quiet.
+	 */
+	stalled?: string;
 }
 
 /** An interactive UI request forwarded from a child's ask_user tool. */
@@ -887,6 +1245,12 @@ class RpcChild {
 	recentTools: string[] = [];
 	alive = true;
 	/**
+	 * When the child last emitted anything. Only the child moves this — a steer
+	 * or a status ping from the parent is evidence the parent is anxious, not
+	 * that the child is still working.
+	 */
+	lastActivityAt = Date.now();
+	/**
 	 * Context utilization 0–100 as the child itself reports it (via
 	 * get_session_stats after each assistant message), so custom providers
 	 * work too. Undefined until the first report or when the child can't say.
@@ -900,6 +1264,7 @@ class RpcChild {
 	private stderrTail = "";
 	private lastTool: string | undefined;
 	private exited = false;
+	private stallTimer?: ReturnType<typeof setInterval>;
 	private run?: {
 		resolve: (outcome: RunOutcome) => void;
 		outcome: RunOutcome;
@@ -948,14 +1313,30 @@ class RpcChild {
 				outcome: { finalText: "", toolCount: 0, turns: 0, usage: { input: 0, output: 0, cost: 0 } },
 				timedOut: false,
 			};
+			this.lastActivityAt = Date.now();
 			this.armTimer();
+			this.armStallCheck();
 			this.send({ type: "prompt", message });
 		});
 	}
 
+	/** How long since the child last emitted anything. */
+	idleMs(): number {
+		return Date.now() - this.lastActivityAt;
+	}
+
+	/** True once the child has gone quiet long enough to be considered hung. */
+	get stalled(): boolean {
+		return Boolean(this.run) && this.idleMs() >= CHILD_STALL_MS;
+	}
+
 	respondUi(id: string, payload: UiResponsePayload): void {
 		this.send({ type: "extension_ui_response", id, ...payload });
-		this.armTimer(); // question answered — the run clock starts again
+		// Question answered — both clocks start again from now, not from
+		// whenever the child last spoke before it asked.
+		this.lastActivityAt = Date.now();
+		this.armTimer();
+		this.armStallCheck();
 	}
 
 	/**
@@ -967,6 +1348,10 @@ class RpcChild {
 	 */
 	steer(message: string): boolean {
 		if (!this.alive || !this.run) return false;
+		// Refuse to steer a child that has already gone quiet. The stall
+		// watchdog is about to settle and kill it, and reporting a successful
+		// steer here would tell the caller its message landed somewhere.
+		if (this.stalled) return false;
 		this.send({ type: "steer", message });
 		this.armTimer(); // fresh intent — give the redirected work a full clock
 		return true;
@@ -1015,10 +1400,36 @@ class RpcChild {
 		if (this.run) this.run.timer = undefined;
 	}
 
+	/**
+	 * Poll for a child that has stopped emitting. Unlike the run timeout this
+	 * clock is driven purely by child events, so parent-side steering can't
+	 * extend it: a hung child is settled and killed regardless of how often it
+	 * is pinged, and its partial output is delivered rather than lost.
+	 */
+	private armStallCheck(): void {
+		this.clearStallCheck();
+		this.stallTimer = setInterval(() => {
+			const run = this.run;
+			if (!run) return this.clearStallCheck();
+			const idle = this.idleMs();
+			if (idle < CHILD_STALL_MS) return;
+			const tools = run.outcome.toolCount;
+			run.outcome.stalled = `Stalled: no output for ${formatDuration(idle)} after ${tools} tool use${tools === 1 ? "" : "s"}.`;
+			this.kill(run.outcome.stalled);
+		}, CHILD_STALL_POLL_MS);
+		this.stallTimer.unref?.();
+	}
+
+	private clearStallCheck(): void {
+		if (this.stallTimer) clearInterval(this.stallTimer);
+		this.stallTimer = undefined;
+	}
+
 	private settleRun(): void {
 		const run = this.run;
 		if (!run) return;
 		this.clearTimer();
+		this.clearStallCheck();
 		this.run = undefined;
 		run.resolve(run.outcome);
 	}
@@ -1027,6 +1438,7 @@ class RpcChild {
 		if (this.exited) return;
 		this.exited = true;
 		this.alive = false;
+		this.clearStallCheck();
 		const run = this.run;
 		if (run) {
 			const o = run.outcome;
@@ -1079,6 +1491,8 @@ class RpcChild {
 		} catch {
 			return;
 		}
+		// Any parsed event is proof of life, and only the child can produce one.
+		this.lastActivityAt = Date.now();
 		const run = this.run;
 		if (evt.type === "tool_execution_start") {
 			this.toolCount++;
@@ -1131,6 +1545,7 @@ class RpcChild {
 			const method = evt.method;
 			if (method === "select" || method === "input" || method === "confirm") {
 				this.clearTimer(); // waiting on the user, not the child
+				this.clearStallCheck(); // a silent child with a pending question isn't hung
 				this.callbacks.onUiRequest?.({
 					id: evt.id,
 					method,
@@ -1297,7 +1712,35 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 						contextPercent: session.child.contextPercent,
 					});
 					updateWidget(opts.ctx);
-					opts.ctx.ui.notify(`${sessionLabel(session)} needs input: ${req.title} — alt+a to answer`, "warning");
+					opts.ctx.ui.notify(`${sessionLabel(session)} needs input: ${req.title} — ↓ then → to answer`, "warning");
+					// Tell the lead too. send_message already routes a reply into a
+					// pending question, but until now nothing told the lead a question
+					// existed, so every blocked agent waited on the human even when the
+					// lead knew the answer perfectly well.
+					const options = req.options?.length ? `\nOptions: ${req.options.join(" | ")}` : "";
+					const detail = req.message?.trim() ? `\n${req.message.trim()}` : "";
+					pi.sendMessage(
+						{
+							customType: TEAMMATE_MESSAGE_TYPE,
+							content:
+								`@${session.name} is blocked waiting for an answer:\n\n${req.title}${detail}${options}\n\n` +
+								`Answer it with send_message {name: "${session.name}", message: "<answer>"} — you have the project context it lacks, so resolve it yourself if you can. ` +
+								`Leave it for the user only if the decision is genuinely theirs (a preference, an approval, something you cannot look up).`,
+							display: true,
+							details: {
+								name: session.name,
+								agentType: session.agentType,
+								description: session.description,
+								color: session.color,
+								toolCount: session.child.toolCount,
+								tokens: session.child.tokens,
+								durationMs: Date.now() - session.startedAt,
+								failed: false,
+								needsInput: true,
+							},
+						},
+						{ triggerTurn: true, deliverAs: "steer" },
+					);
 				},
 				onExit: () => {
 					if (!sessions.has(session.name) || session.shutdown || session.kind === "sync") return;
@@ -1359,6 +1802,13 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 		updateWidget(ctx);
 	}
 
+	/**
+	 * A reply long enough to read as substantive work. Below this a zero-tool
+	 * turn is an acknowledgement ("on it") and needs no warning; above it, a
+	 * turn that touched nothing is asserting things it never checked.
+	 */
+	const UNVERIFIED_REPLY_MIN_CHARS = 400;
+
 	/** Deliver a turn's outcome to the parent session as an @name message. */
 	function makeReplyDeliver(session: AgentSession): (outcome: RunOutcome, durationMs: number) => void {
 		return (outcome, durationMs) => {
@@ -1372,10 +1822,21 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 			const shutdownNote = session.shutdownRequested
 				? `\n\n(@${session.name} requests shutdown — approve with send_message {name: "${session.name}", shutdown: true}, or send follow-up work to keep it going)`
 				: "";
+			// Provenance travels in the content, not just in details: details
+			// only reach the TUI badge, and the model deciding whether to trust
+			// this reply is reading the content. A researched report and an
+			// invented one are otherwise indistinguishable here.
+			const tools = outcome.toolCount;
+			const provenance = `${tools} tool use${tools === 1 ? "" : "s"} · ${formatTokens(outcome.usage.input + outcome.usage.output)} tokens · ${formatDuration(durationMs)}`;
+			const unverifiedNote =
+				!failed && tools === 0 && reply.length >= UNVERIFIED_REPLY_MIN_CHARS
+					? `\n\n⚠ @${session.name} made no tool calls this turn — it read no files and ran no commands. Any file paths, line numbers, or quoted code above are unverified and may not exist. Check them against the source before acting on them or passing them on.`
+					: "";
+			const stallNote = outcome.stalled ? `\n\n⚠ ${outcome.stalled} The reply above is whatever it had produced before it went quiet, not a finished report.` : "";
 			pi.sendMessage(
 				{
 					customType: TEAMMATE_MESSAGE_TYPE,
-					content: `Message from ${session.kind === "teammate" ? "teammate" : "background agent"} @${session.name}:\n\n${reply}${shutdownNote}`,
+					content: `Message from ${session.kind === "teammate" ? "teammate" : "background agent"} @${session.name} (${provenance}):\n\n${reply}${unverifiedNote}${stallNote}${shutdownNote}`,
 					display: true,
 					details: {
 						name: session.name,
@@ -1386,10 +1847,18 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 						tokens: outcome.usage.input + outcome.usage.output,
 						durationMs,
 						failed,
+						unverified: Boolean(unverifiedNote),
+						stalled: Boolean(outcome.stalled),
 						requestsShutdown: session.shutdownRequested,
 					},
 				},
-				{ triggerTurn: true, deliverAs: "followUp" },
+				// "steer" delivers at the lead's next tool-call boundary;
+				// "followUp" waits until it has no tool calls left. Under
+				// followUp a lead that polls — sleeping in bash, re-reading
+				// journal files — never stops calling tools, so it never
+				// receives the results it is waiting for and polls harder. Its
+				// own impatience was withholding its answers.
+				{ triggerTurn: true, deliverAs: "steer" },
 			);
 		};
 	}
@@ -1411,7 +1880,7 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 		batch.forEach((report, i) => {
 			pi.sendMessage(
 				{ customType: RESULT_MESSAGE_TYPE, content: report.content, display: true, details: report.details },
-				{ triggerTurn: i === batch.length - 1, deliverAs: "followUp" },
+				{ triggerTurn: i === batch.length - 1, deliverAs: "steer" },
 			);
 		});
 	}
@@ -1559,7 +2028,7 @@ Usage notes:
 7. run_in_background: true makes the tool return immediately; the agent's report arrives as a message when it completes. Use for long tasks you don't need to block on. The agent keeps its context and stays alive for a few minutes after finishing, so you can send follow-ups with the send_message tool (the launch result tells you its @name).
 8. Providing name spawns a persistent TEAMMATE instead of a one-shot subagent: it keeps its conversation context, replies arrive as @name messages, and you can send follow-ups with the send_message tool. Use when work is iterative or long-lived. The roster is flat — teammates cannot spawn anything.
 9. pane: true (with name) puts the teammate in a tmux split pane as a fully interactive pi session the user can see and chat with directly. Use when the user asks for a visible pane or wants to supervise.
-10. Agents may ask the user a question via their ask_user tool when blocked on a decision; the question is surfaced to the user directly (widget + alt+a manager) and the agent waits for the answer. You do not need to do anything when that happens.`,
+10. Agents may ask a question via their ask_user tool when blocked on a decision. The question is delivered to you as a message and the agent waits. Answer it yourself with send_message {name, message} whenever you can — you have the project context the agent lacks, and agents often ask about things you already know or can look up in seconds. Escalate to the user only when the decision is genuinely theirs: a preference, an approval, or a fact neither of you can find.`,
 		parameters: parameters as never,
 		executionMode: "parallel",
 
@@ -1598,8 +2067,8 @@ Usage notes:
 				const note = d.pane
 					? `⎿  teammate in tmux pane ${d.pane} — report arrives when it writes one`
 					: d.teammateName
-						? `⎿  teammate @${d.teammateName} — replies arrive as messages; follow up with send_message (alt+a manages)`
-						: "⎿  running in background — report arrives when complete (alt+a manages)";
+						? `⎿  teammate @${d.teammateName} — replies arrive as messages; follow up with send_message (↓ browses the roster)`
+						: "⎿  running in background — report arrives when complete (↓ browses the roster)";
 				c.addChild(new TruncatedText(agentHeader(theme, glyph, typeName, d.color, desc, suffix), 0, 0));
 				c.addChild(new TruncatedText(theme.fg("dim", note), 0, 0));
 				return c;
@@ -1666,7 +2135,7 @@ Usage notes:
 				runSessionTurn(session, params.prompt, ctx, makeReplyDeliver(session));
 
 				return {
-					content: [{ type: "text", text: `Teammate '@${name}' (${typeName}) spawned in-process. Its replies will arrive as messages from @${name}; use the send_message tool for follow-ups. Continue with other work — do not wait or poll.` }],
+					content: [{ type: "text", text: `Teammate '@${name}' (${typeName}) spawned in-process. Its replies will arrive as messages from @${name}; use the send_message tool for follow-ups. Its reply interrupts you as soon as it lands, so do not sleep, poll, or ask it for status — that only spends tokens. Do other useful work or end your turn.` }],
 					details: {
 						status: "launched",
 						agentType: typeName,
@@ -1747,7 +2216,7 @@ Usage notes:
 								cancelled: false,
 							},
 						},
-						{ triggerTurn: true, deliverAs: "followUp" },
+						{ triggerTurn: true, deliverAs: "steer" },
 					);
 				});
 				teammates.set(paneId, mate);
@@ -1774,7 +2243,7 @@ Usage notes:
 			if (params.run_in_background === true && ctx.hasUI) {
 				const session = spawnBackgroundSession(agent, typeName, params.description, params.prompt, model, ctx);
 				return {
-					content: [{ type: "text", text: `Background agent '${session.name}' launched (${typeName}). Its report will be delivered as a message when it completes; while it is alive you can send follow-ups with send_message {name: "${session.name}"}. Continue with other work — do not wait or poll.` }],
+					content: [{ type: "text", text: `Background agent '${session.name}' launched (${typeName}). Its report will be delivered as a message when it completes; while it is alive you can send follow-ups with send_message {name: "${session.name}"}. Its report interrupts you as soon as it lands, so do not sleep or poll for it. Do other useful work or end your turn.` }],
 					details: {
 						status: "launched",
 						agentType: typeName,
@@ -1790,7 +2259,7 @@ Usage notes:
 
 			// Synchronous subagent: one prompt run, then the child is discarded.
 			// It still joins the roster while running so the user can watch it,
-			// answer its ask_user questions, or kill it from the alt+a manager.
+			// answer its ask_user questions, or kill it from the roster (↓ then →).
 			const dir = makeSessionDir(SESSIONS_DIR, typeName);
 			const promptPath = path.join(dir, "system-prompt.md");
 			fs.writeFileSync(promptPath, assembleSystemPrompt(agent, cwd, model), { mode: 0o600 });
@@ -1934,6 +2403,15 @@ Usage notes:
 					answerUiWithText(session, params.message, ctx);
 					return { content: [{ type: "text", text: `'@${name}' had a pending question; your message was delivered as the answer and its turn resumes. Its reply will arrive as a message.` }], details: { name } };
 				}
+				if (session.state === "working" && params.interrupt !== true && isStatusPing(params.message)) {
+					const since = session.lastStatusPingAt ? Date.now() - session.lastStatusPingAt : Number.POSITIVE_INFINITY;
+					if (since < STATUS_PING_COOLDOWN_MS) {
+						throw new Error(
+							`'@${name}' is still working (${session.child.toolCount} tool use${session.child.toolCount === 1 ? "" : "s"} so far, last active ${formatDuration(session.child.idleMs())} ago) and was already asked for a progress report ${formatDuration(since)} ago. It reports on its own when its turn ends — end your turn and let the reply arrive rather than polling. To actually redirect it, send an instruction instead of a status request; to stop it now and take what it has, pass interrupt: true.`,
+						);
+					}
+					session.lastStatusPingAt = Date.now();
+				}
 				if (session.state === "working") {
 					if (params.interrupt === true) {
 						// Hard stop: queue the message, then abort the turn. Aborting
@@ -1944,11 +2422,24 @@ Usage notes:
 						updateWidget(ctx);
 						return { content: [{ type: "text", text: `'@${name}' is mid-turn; aborting its current work and running your message as a fresh prompt. Its reply will arrive as a message.` }], details: { name, queued: true } };
 					}
+					// A quiet child is about to be settled and killed by the stall
+					// watchdog. Starting a fresh turn on it here would clobber the
+					// pending run and lose the partial output it already produced.
+					if (session.child.stalled) {
+						throw new Error(
+							`'@${name}' has produced no output for ${formatDuration(session.child.idleMs())} and is being shut down as stalled. Whatever it managed to produce will arrive as a message shortly; spawn a fresh agent if you still need the work.`,
+						);
+					}
 					// Default: steer into the live turn — the agent folds the message
 					// in at its next step and keeps its context.
 					if (session.child.steer(params.message)) {
 						updateWidget(ctx);
-						return { content: [{ type: "text", text: `Steered into '@${name}'s current turn; it will fold your message in and redirect without losing context. Its reply arrives as a message when the turn ends.` }], details: { name } };
+						const idle = session.child.idleMs();
+						// "Steered" only means the write landed on a live run. Say how
+						// long the child has actually been quiet so the caller can tell
+						// a working agent from a wedged one.
+						const idleNote = idle > 30_000 ? ` It has been quiet for ${formatDuration(idle)}, so it may be wedged rather than working.` : "";
+						return { content: [{ type: "text", text: `Steered into '@${name}'s current turn; it will fold your message in and redirect without losing context. Its reply arrives as a message when the turn ends.${idleNote}` }], details: { name } };
 					}
 					// No live run to steer (state raced to idle) — fall through to a fresh turn below.
 				}
@@ -1982,7 +2473,7 @@ Usage notes:
 
 	// ─── Workflows: deterministic multi-agent orchestration scripts ───
 
-	const WORKFLOW_RESULT_TYPE = "claude-subagent-workflow-result";
+	const WORKFLOW_RESULT_TYPE = "workflow-result";
 	const WORKFLOWS_DIR = path.join(os.homedir(), ".claude-subagent", "workflows");
 	const WORKFLOW_AGENT_CAP = 50;
 
@@ -2012,6 +2503,191 @@ Usage notes:
 		journal: WorkflowJournalEntry[];
 		/** Journal from the run being resumed; entries are consumed by key. */
 		replay?: { entries: WorkflowJournalEntry[]; used: boolean[] };
+	}
+
+	/** Globals the workflow sandbox provides, plus the JS surface a script may lean on. */
+	const WORKFLOW_SANDBOX_GLOBALS = ["args", "agent", "parallel", "pipeline", "phase", "log", "budget", "console", "meta"];
+	const WORKFLOW_KNOWN_NAMES = new Set([
+		...WORKFLOW_SANDBOX_GLOBALS,
+		// JS globals reachable from the vm context
+		"Array", "Object", "String", "Number", "Boolean", "Math", "JSON", "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet",
+		"Promise", "Symbol", "BigInt", "Error", "TypeError", "RangeError", "SyntaxError", "Infinity", "NaN", "undefined",
+		"isNaN", "isFinite", "parseInt", "parseFloat", "encodeURIComponent", "decodeURIComponent", "structuredClone", "globalThis",
+		// keywords and literals that tokenize as bare words
+		"const", "let", "var", "function", "class", "return", "await", "async", "if", "else", "for", "while", "do", "break",
+		"continue", "switch", "case", "default", "try", "catch", "finally", "throw", "new", "typeof", "instanceof", "in", "of",
+		"delete", "void", "this", "super", "yield", "export", "import", "from", "as", "extends", "static", "get", "set",
+		"null", "true", "false",
+	]);
+
+	/**
+	 * Strip comments and string bodies so identifier scanning sees code only.
+	 * Template literals keep their `${...}` expressions — those are real
+	 * references — but drop their literal text, which is usually prose.
+	 */
+	function stripNonCode(src: string): string {
+		let out = "";
+		let i = 0;
+		const n = src.length;
+		// Templates nest: `a ${ b.map(x => `c ${d}`) } e`. Without a stack the
+		// inner template's prose is read as code and every word in it looks like
+		// an undeclared identifier.
+		const stack: Array<{ kind: "tpl" } | { kind: "expr"; depth: number }> = [];
+		const top = () => stack[stack.length - 1];
+		// A '/' starts a regex only where a value may begin. Without this,
+		// escapes inside a regex (\s, \S, \d) read as bare identifiers.
+		const regexAllowedAfter = /(^|[=(,:[!&|?{};+\-*%~^<>]|\b(?:return|typeof|case|in|of|new|delete|void|instanceof|do|else|yield|await))\s*$/;
+		while (i < n) {
+			const c = src[i];
+			const next = src[i + 1];
+			if (top()?.kind === "tpl") {
+				if (c === "\\") { i += 2; continue; }
+				if (c === "`") { stack.pop(); i++; continue; }
+				if (c === "$" && next === "{") { stack.push({ kind: "expr", depth: 0 }); i += 2; out += " ( "; continue; }
+				i++; // template prose is not code
+				continue;
+			}
+			if (c === "/" && next === "/") {
+				while (i < n && src[i] !== "\n") i++;
+				continue;
+			}
+			if (c === "/" && next === "*") {
+				i += 2;
+				while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++;
+				i += 2;
+				continue;
+			}
+			if (c === '"' || c === "'") {
+				const quote = c;
+				i++;
+				while (i < n && src[i] !== quote) i += src[i] === "\\" ? 2 : 1;
+				i++;
+				out += ' "" ';
+				continue;
+			}
+			if (c === "`") {
+				stack.push({ kind: "tpl" });
+				i++;
+				continue;
+			}
+			if (c === "/" && regexAllowedAfter.test(out)) {
+				i++;
+				let inClass = false;
+				while (i < n) {
+					const r = src[i];
+					if (r === "\\") { i += 2; continue; }
+					if (r === "[") inClass = true;
+					else if (r === "]") inClass = false;
+					else if (r === "/" && !inClass) { i++; break; }
+					else if (r === "\n") break; // unterminated: not a regex after all
+					i++;
+				}
+				while (i < n && /[a-z]/.test(src[i])) i++; // flags
+				out += " 0 "; // a value stands in for the literal, contributing no identifier
+				continue;
+			}
+			const cur = top();
+			if (cur?.kind === "expr") {
+				if (c === "{") cur.depth++;
+				else if (c === "}") {
+					if (cur.depth === 0) { stack.pop(); i++; out += " ) "; continue; }
+					cur.depth--;
+				}
+			}
+			out += c;
+			i++;
+		}
+		return out;
+	}
+
+	/** Names the script binds anywhere: declarations, params, destructuring, catch clauses. */
+	function declaredNames(code: string): Set<string> {
+		const names = new Set<string>();
+		const add = (raw: string | undefined) => {
+			for (const m of (raw ?? "").matchAll(/([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+		};
+		for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+		for (const m of code.matchAll(/\b(?:const|let|var)\s*([{[][^}\]]*[}\]])/g)) add(m[1]);
+		for (const m of code.matchAll(/\b(?:function|class)\s+([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+		for (const m of code.matchAll(/\bfunction\s*[A-Za-z_$\w]*\s*\(([^)]*)\)/g)) add(m[1]);
+		for (const m of code.matchAll(/\(([^)]*)\)\s*=>/g)) add(m[1]);
+		for (const m of code.matchAll(/(?:^|[^.\w$])([A-Za-z_$][\w$]*)\s*=>/g)) names.add(m[1]);
+		for (const m of code.matchAll(/\bcatch\s*\(([^)]*)\)/g)) add(m[1]);
+		// Any assignment target counts as bound: it covers later declarators in
+		// `const a = 1, b = 2`, and a bare `x = 1` in this non-strict wrapper
+		// creates the binding rather than throwing.
+		for (const m of code.matchAll(/(?:^|[^.\w$!<>=+\-*/%&|^])([A-Za-z_$][\w$]*)\s*=(?![=>])/g)) names.add(m[1]);
+		return names;
+	}
+
+	interface WorkflowLint {
+		errors: string[];
+		warnings: string[];
+	}
+
+	/**
+	 * Pre-flight a workflow script before any agent spawns. A script that throws
+	 * halfway discards every result it already paid for, so the cheap checks —
+	 * does it compile, does it reference something it never bound — are worth
+	 * running first. Shape problems (sequential fan-out, no return value,
+	 * unschema'd agents) are reported but don't block.
+	 */
+	function lintWorkflowScript(script: string, scriptPath: string): WorkflowLint {
+		const errors: string[] = [];
+		const warnings: string[] = [];
+
+		const body = script.replace(/^\s*export\s+/gm, "");
+		try {
+			new vm.Script(`(async () => {\n${body}\n})()`, { filename: scriptPath });
+		} catch (err) {
+			errors.push(`Script does not compile: ${err instanceof Error ? err.message : String(err)}`);
+			return { errors, warnings }; // identifier analysis on unparseable source is noise
+		}
+
+		const code = stripNonCode(body);
+		const declared = declaredNames(code);
+		const unbound = new Set<string>();
+		for (const m of code.matchAll(/(^|[^.\w$])([A-Za-z_$][\w$]*)\s*(:?)/gm)) {
+			const name = m[2];
+			const isObjectKey = m[3] === ":" && !/\?\s*$/.test(m[1]);
+			if (isObjectKey || declared.has(name) || WORKFLOW_KNOWN_NAMES.has(name)) continue;
+			if (/^\d/.test(name)) continue;
+			unbound.add(name);
+		}
+		if (unbound.size) {
+			errors.push(
+				`References ${unbound.size === 1 ? "an identifier that is" : "identifiers that are"} never declared: ${[...unbound].join(", ")}. ` +
+					`This throws a ReferenceError at runtime — often after every agent has already run, discarding all of their work. Fix the name (or declare it) and relaunch.`,
+			);
+		}
+
+		const agentCalls = (code.match(/\bagent\s*\(/g) ?? []).length;
+		const awaitedAgents = (code.match(/\bawait\s+agent\s*\(/g) ?? []).length;
+		const hasFanoutHelper = /\b(pipeline|parallel)\s*\(/.test(code);
+		if (awaitedAgents >= 3 && !hasFanoutHelper) {
+			warnings.push(
+				`${awaitedAgents} sequential 'await agent(...)' calls and no pipeline()/parallel() — these run one at a time, so max_concurrency has no effect. Independent agents belong in pipeline() or parallel().`,
+			);
+		}
+		// agent() returns a promise. Assigning it without awaiting and returning
+		// the variable serialises to {} — the run reports success in 0s with 0
+		// tokens while its agents are abandoned mid-flight. Legitimate deferred
+		// awaits (const p = agent(...); ... await p) are excluded.
+		const unawaited = [...code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*agent\s*\(/g)]
+			.map((m) => m[1])
+			.filter((name) => !new RegExp(`await\\s+${name}\\b`).test(code) && !/Promise\s*\.\s*all/.test(code));
+		if (unawaited.length) {
+			warnings.push(
+				`${unawaited.join(", ")} ${unawaited.length === 1 ? "is" : "are"} assigned from agent() without await, so ${unawaited.length === 1 ? "it holds" : "they hold"} a pending promise rather than a result. Returning ${unawaited.length === 1 ? "it" : "them"} yields {} and the run reports success in 0s while the agents are abandoned. Await the call, or wrap it in a thunk for parallel()/pipeline().`,
+			);
+		}
+		if (agentCalls > 0 && !/\bschema\s*:/.test(code)) {
+			warnings.push("No agent() call passes a schema, so every result is free-form text — agents often return narration rather than findings. Pass a JSON Schema to force structured output.");
+		}
+		if (!/\breturn\b/.test(code)) {
+			warnings.push("Script never returns a value; results reach only the run log. Return the data you want delivered as the workflow's result message.");
+		}
+		return { errors, warnings };
 	}
 
 	/** Stable key for one agent() call: same prompt+opts → same key. */
@@ -2354,6 +3030,15 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 			const name = /name:\s*["']([\w-]+)["']/.exec(params.script)?.[1] ?? id;
 			fs.mkdirSync(WORKFLOWS_DIR, { recursive: true });
 			const scriptPath = path.join(WORKFLOWS_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${name}.mjs`);
+
+			// Pre-flight before anything is spawned: a script that dies partway
+			// through throws away every agent result it already paid for.
+			const lint = lintWorkflowScript(params.script, scriptPath);
+			if (lint.errors.length) {
+				fs.writeFileSync(scriptPath, params.script); // keep it for inspection
+				throw new Error(`Workflow not started — ${lint.errors.join(" ")} (script saved to ${scriptPath})`);
+			}
+			const lintNote = lint.warnings.length ? `\n\nBefore it gets far, consider:\n${lint.warnings.map((w) => `- ${w}`).join("\n")}` : "";
 			fs.writeFileSync(scriptPath, params.script);
 			const timeoutMs = Math.min(Math.max(params.timeout_minutes ?? 30, 1), 120) * 60_000;
 
@@ -2387,7 +3072,7 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 				budgetTotal: params.token_budget,
 				startedAt: Date.now(),
 				deadline: Date.now() + timeoutMs,
-				logs: [],
+				logs: lint.warnings.map((w) => `lint: ${w}`),
 				journal: [],
 				replay,
 			};
@@ -2407,9 +3092,9 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 							customType: WORKFLOW_RESULT_TYPE,
 							content: `Workflow ${run.name} (${id}) completed in ${formatDuration(run.endedAt - run.startedAt)} — ${run.agentsSpawned} agents${cacheNote}, ${formatTokens(run.tokens)} tokens. Resume with resume_from_run_id "${id}" to rerun with edits.\n\nReturn value:\n${clipped}`,
 							display: true,
-							details: { id, name: run.name, ok: true, scriptPath },
+							details: { id, name: run.name, ok: true, scriptPath, agents: run.agentsSpawned, tokens: run.tokens, durationMs: run.endedAt - run.startedAt },
 						},
-						{ triggerTurn: true, deliverAs: "followUp" },
+						{ triggerTurn: true, deliverAs: "steer" },
 					);
 				})
 				.catch((err) => {
@@ -2421,9 +3106,9 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 							customType: WORKFLOW_RESULT_TYPE,
 							content: `Workflow ${run.name} (${id}) FAILED after ${formatDuration(run.endedAt - run.startedAt)}: ${run.error}\n\nRecent log:\n${run.logs.slice(-10).join("\n")}`,
 							display: true,
-							details: { id, name: run.name, ok: false, scriptPath },
+							details: { id, name: run.name, ok: false, scriptPath, agents: run.agentsSpawned, tokens: run.tokens, durationMs: run.endedAt - run.startedAt },
 						},
-						{ triggerTurn: true, deliverAs: "followUp" },
+						{ triggerTurn: true, deliverAs: "steer" },
 					);
 				})
 				.finally(() => updateWorkflowStatus(ctx));
@@ -2432,7 +3117,7 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 				content: [
 					{
 						type: "text",
-						text: `Workflow ${run.name} started with run ID ${id} (script saved to ${scriptPath}).${resumeNote} It runs in the background — the return value will arrive as a message when it completes. Continue with other work or end your turn; use /workflows to watch progress.`,
+						text: `Workflow ${run.name} started with run ID ${id} (script saved to ${scriptPath}).${resumeNote} It runs in the background — the return value arrives as a message that interrupts you as soon as the run completes. Do not sleep, poll, or inspect its journal files while you wait; that only spends tokens and delays nothing. Do other useful work or end your turn; use /workflows to watch progress.${lintNote}`,
 					},
 				],
 				details: { id, name: run.name, scriptPath },
@@ -2506,46 +3191,6 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		updateWidget(ctx);
 	}
 
-	/** Render a child session transcript as readable text (skips thinking blocks). */
-	function formatTranscript(sessionFile: string): string | undefined {
-		let raw: string;
-		try {
-			raw = fs.readFileSync(sessionFile, "utf-8");
-		} catch {
-			return undefined;
-		}
-		const out: string[] = [];
-		for (const line of raw.split("\n")) {
-			if (!line.trim()) continue;
-			let entry: { type?: string; message?: { role?: string; toolName?: string; content?: unknown } };
-			try {
-				entry = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (entry.type !== "message" || !entry.message) continue;
-			const m = entry.message;
-			if (m.role === "user") {
-				out.push("## user", extractText(m.content).trim() || "(empty)", "");
-			} else if (m.role === "assistant") {
-				const parts: string[] = [];
-				if (Array.isArray(m.content)) {
-					for (const b of m.content as Array<{ type?: string; text?: string; name?: string; arguments?: unknown }>) {
-						if (b.type === "text" && b.text?.trim()) parts.push(b.text.trim());
-						else if (b.type === "toolCall") parts.push(`[tool: ${b.name ?? "?"} ${JSON.stringify(b.arguments ?? {}).slice(0, 120)}]`);
-					}
-				}
-				out.push("## assistant", parts.join("\n") || "(thinking only)", "");
-			} else if (m.role === "toolResult") {
-				const text = extractText(m.content).trim();
-				const lines = text.split("\n");
-				const shown = lines.slice(0, 10).join("\n");
-				out.push(`## result: ${m.toolName ?? "tool"}`, shown + (lines.length > 10 ? `\n… (${lines.length - 10} more lines)` : ""), "");
-			}
-		}
-		return out.length ? out.join("\n") : undefined;
-	}
-
 	/** Scrollable rendered-markdown pager overlay (↑/↓, pgup/pgdn, g/G, esc). */
 	async function showMarkdownPager(ctx: ExtensionContext, title: string, markdown: string): Promise<void> {
 		await ctx.ui.custom<void>(
@@ -2607,17 +3252,25 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 	async function viewTranscript(session: AgentSession, ctx: ExtensionContext): Promise<void> {
 		await ctx.ui.custom<void>(
 			(tui, _thm, _keybindings, done) => {
-				let text = formatTranscript(session.sessionFile) ?? "*(no messages yet)*";
-				let md = new Markdown(text, 1, 0, getMarkdownTheme());
 				let offset = 0;
 				let view = 20;
 				let follow = true;
 				let confirmStop = false;
+				// The transcript is rebuilt from the file on demand (cached by
+				// size/mtime), so the poll only needs to ask for a repaint.
+				let lastStamp = "";
+				const stampOf = () => {
+					try {
+						const st = fs.statSync(session.sessionFile);
+						return `${st.size}:${st.mtimeMs}`;
+					} catch {
+						return "missing";
+					}
+				};
 				const refresh = setInterval(() => {
-					const next = formatTranscript(session.sessionFile) ?? "*(no messages yet)*";
-					if (next !== text) {
-						text = next;
-						md = new Markdown(text, 1, 0, getMarkdownTheme());
+					const next = stampOf();
+					if (next !== lastStamp) {
+						lastStamp = next;
 						tui.requestRender();
 					} else if (session.state === "working" || session.state === "needs-input") {
 						tui.requestRender(); // keep the header spinner/stats fresh
@@ -2649,7 +3302,10 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 				return {
 					render(width: number): string[] {
 						const thm = ctx.ui.theme;
-						const body = md.render(width);
+						// Same builder the inline preview uses, so the two views can
+						// never drift. Thinking blocks stay visible here.
+						const body = transcriptLinesCached(session.sessionFile, width, { tui, cwd: ctx.cwd, expanded: true });
+						if (body.length === 0) body.push(thm.fg("muted", " (no messages yet)"));
 						view = Math.max(6, Math.floor((tui.terminal.rows || 30) * 0.8) - 5);
 						const bottom = Math.max(0, body.length - view);
 						if (follow) offset = bottom;
@@ -2764,6 +3420,77 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		ui.notify(`Dispatched '${session.name}' (${typeName}) — its report will arrive as a message`, "info");
 	}
 
+	interface SessionAction {
+		label: string;
+		run: () => void | Promise<void>;
+	}
+
+	/** Kill a roster session the way the UI should: sync agents settle their pending tool call. */
+	function killSession(session: AgentSession, ctx: ExtensionContext, reason: string): void {
+		if (session.kind === "sync") session.child.kill(reason);
+		else destroySession(session, ctx);
+	}
+
+	/**
+	 * Everything you can do to one agent. Shared by the roster's action menu and
+	 * the arrow-driven browser, so neither can offer a different set.
+	 */
+	function sessionActions(session: AgentSession, ctx: ExtensionContext): SessionAction[] {
+		const ui = ctx.ui;
+		const kill = () => killSession(session, ctx, "Aborted by the user.");
+		return [
+			...(session.pendingUi ? [{ label: "Answer question", run: () => answerPendingUi(session, ctx) }] : []),
+			...(session.shutdownRequested ? [{ label: "Approve shutdown", run: kill }] : []),
+			{ label: "Peek", run: () => peekSession(session, ctx) },
+			...(session.kind !== "sync"
+				? [
+						{
+							label: "Send message",
+							run: async () => {
+								const message = await ui.input(`Message @${session.name}`, "sent as a follow-up turn");
+								if (!message?.trim()) return;
+								if (session.state === "working") {
+									if (!session.child.steer(message)) session.queue.push(message);
+								} else {
+									runSessionTurn(session, message, ctx, makeReplyDeliver(session));
+								}
+								updateWidget(ctx);
+							},
+						},
+						{
+							label: "Rename",
+							run: async () => {
+								const next = await ui.input(`Rename @${session.name}`, session.name);
+								const clean = next ? sanitizeTeammateName(next) : "";
+								if (!clean || clean === session.name) return;
+								if (sessions.has(clean)) {
+									ui.notify(`'@${clean}' already exists`, "warning");
+									return;
+								}
+								sessions.delete(session.name);
+								session.name = clean;
+								sessions.set(clean, session);
+								updateWidget(ctx);
+							},
+						},
+					]
+				: []),
+			{ label: "Watch transcript (live)", run: () => viewTranscript(session, ctx) },
+			...(insideTmux() ? [{ label: "Open transcript in tmux pane", run: () => openSessionPane(ui, session.sessionFile) }] : []),
+			{ label: session.kind === "sync" ? "Kill" : "Shut down", run: kill },
+		];
+	}
+
+	/** Action menu for a single agent, opened with → from the arrow browser. */
+	async function openSessionActions(session: AgentSession, ctx: ExtensionContext): Promise<void> {
+		const actions = sessionActions(session, ctx);
+		const close = "Close";
+		const choice = await ctx.ui.select(`${sessionLabel(session)} · ${session.state}`, [...actions.map((a) => a.label), close]);
+		if (!choice || choice === close) return;
+		await actions.find((a) => a.label === choice)?.run();
+		updateWidget(ctx);
+	}
+
 	async function openAgentManager(ctx: ExtensionContext, killAllDirectly = false): Promise<void> {
 		const ui = ctx.ui;
 		pruneDeadTeammates();
@@ -2777,62 +3504,11 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		}
 		const entries: Entry[] = [
 			...roster.map((session): Entry => {
-				const kill = () => {
-					if (session.kind === "sync") {
-						// The pending agent tool call owns cleanup; killing the
-						// child settles it with an abort error.
-						session.child.kill("Aborted by the user via the agent manager.");
-					} else {
-						destroySession(session, ctx);
-					}
-				};
 				const stateText = session.state === "needs-input" ? `needs input: ${session.pendingUi?.title ?? "question"}` : session.state;
 				return {
 					label: `${sessionLabel(session)} (${session.description}) · ${stateText} · ${formatDuration(Date.now() - session.startedAt)}`,
-					kill,
-					actions: [
-						...(session.pendingUi ? [{ label: "Answer question", run: () => answerPendingUi(session, ctx) }] : []),
-						...(session.shutdownRequested ? [{ label: "Approve shutdown", run: kill }] : []),
-						{ label: "Peek", run: () => peekSession(session, ctx) },
-						...(session.kind !== "sync"
-							? [
-									{
-										label: "Send message",
-										run: async () => {
-											const message = await ui.input(`Message ${sessionLabel(session)}`, "type a message for the agent");
-											if (!message?.trim()) return;
-											session.shutdownRequested = false;
-											if (session.pendingUi) {
-												answerUiWithText(session, message, ctx);
-												ui.notify(`Answered ${sessionLabel(session)}'s question`, "info");
-											} else if (session.state === "working") {
-												session.queue.push(message);
-												ui.notify(`Queued for ${sessionLabel(session)}`, "info");
-											} else if (session.child.alive) {
-												runSessionTurn(session, message, ctx, makeReplyDeliver(session));
-												ui.notify(`Sent to ${sessionLabel(session)} — reply arrives as a message`, "info");
-											} else {
-												ui.notify(`${sessionLabel(session)} has exited`, "warning");
-											}
-											updateWidget(ctx);
-										},
-									},
-									{
-										label: "Rename",
-										run: async () => {
-											const v = await ui.input(`Rename ${sessionLabel(session)}`, session.description);
-											if (v?.trim()) {
-												session.description = v.trim();
-												updateWidget(ctx);
-											}
-										},
-									},
-								]
-							: []),
-						{ label: "Watch transcript (live)", run: () => viewTranscript(session, ctx) },
-						...(insideTmux() ? [{ label: "Open transcript in tmux pane", run: () => openSessionPane(ui, session.sessionFile) }] : []),
-						{ label: session.kind === "sync" ? "Kill" : "Shut down", run: kill },
-					],
+					kill: () => killSession(session, ctx, "Aborted by the user via the agent manager."),
+					actions: sessionActions(session, ctx),
 				};
 			}),
 			...paneMates.map((mate): Entry => {
@@ -2922,9 +3598,92 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		},
 	});
 
-	pi.registerShortcut("alt+a", {
-		description: "Open the agent manager",
-		handler: (ctx) => openAgentManager(ctx),
+	/**
+	 * Wrap the editor so ↓ on an empty prompt walks the agent roster shown
+	 * below it, previewing the selected agent's transcript above it. Typing is
+	 * never affected: the intercept fires only when the editor is empty and
+	 * agents exist, and any key that isn't a browse control exits browsing and
+	 * is forwarded on. Everything except handleInput is proxied straight to the
+	 * wrapped editor, so autocomplete, paste, history and any future editor API
+	 * keep working.
+	 */
+	function installEditorBrowser(ctx: ExtensionContext): void {
+		if (!ctx.hasUI) return;
+		// getEditorComponent() is undefined until some extension sets a factory —
+		// the built-in editor is not exposed as one. Fall back to building the
+		// same CustomEditor pi builds by default, so there is always something
+		// to wrap. pi re-wires onSubmit/onChange/text/padding onto whatever we
+		// return, and the proxy passes those writes through.
+		const inner = ctx.ui.getEditorComponent();
+		type Wrapped = Record<string, unknown> & { handleInput?(data: string): void };
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+			const editor = (inner ? inner(tui, theme, keybindings) : new CustomEditor(tui, theme, keybindings)) as unknown as Wrapped;
+			const exitBrowse = () => {
+				browseIndex = null;
+				updateWidget(ctx);
+				tui.requestRender();
+			};
+			const move = (delta: number) => {
+				const list = sortedSessions();
+				if (list.length === 0) {
+					exitBrowse();
+					return;
+				}
+				browseIndex = Math.max(0, Math.min((browseIndex ?? 0) + delta, list.length - 1));
+				updateWidget(ctx);
+				tui.requestRender();
+			};
+			return new Proxy(editor, {
+				get(target, prop) {
+					if (prop !== "handleInput") {
+						// Read with the target as receiver, not the proxy: a getter
+						// that reads its own fields would otherwise re-enter this
+						// trap and see bound copies of its own methods.
+						const value = Reflect.get(target, prop, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					}
+					return (data: string) => {
+						if (browseIndex === null) {
+							// Enter browsing only from an empty prompt, so ↓ keeps its
+							// normal meaning whenever the user is composing.
+							if (matchesKey(data, "down") && !ctx.ui.getEditorText().trim() && sessions.size > 0) {
+								browseIndex = 0;
+								updateWidget(ctx);
+								tui.requestRender();
+								return;
+							}
+							target.handleInput?.(data);
+							return;
+						}
+						if (matchesKey(data, "down")) return move(1);
+						// ↑ past the top returns to the editor rather than sticking.
+						if (matchesKey(data, "up")) return browseIndex === 0 ? exitBrowse() : move(-1);
+						if (matchesKey(data, "escape")) return exitBrowse();
+						if (matchesKey(data, "return")) {
+							const selected = normalizeBrowse();
+							exitBrowse();
+							if (selected) void viewTranscript(selected, ctx);
+							return;
+						}
+						// → is everything else you can do to this agent: answer its
+						// question, message it, rename it, stop it. This replaces alt+a.
+						if (matchesKey(data, "right")) {
+							const selected = normalizeBrowse();
+							exitBrowse();
+							if (selected) void openSessionActions(selected, ctx);
+							return;
+						}
+						// Anything else means the user is typing again.
+						exitBrowse();
+						target.handleInput?.(data);
+					};
+				},
+			}) as unknown as CustomEditor;
+		});
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		installEditorBrowser(ctx);
 	});
 
 	interface ResultMessageDetails {
@@ -2967,6 +3726,46 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		return c;
 	});
 
+	interface WorkflowResultDetails {
+		id: string;
+		name: string;
+		ok: boolean;
+		scriptPath?: string;
+		agents?: number;
+		tokens?: number;
+		durationMs?: number;
+	}
+
+	// Without this the message falls back to pi's default rendering, which
+	// prints the raw customType as a tag.
+	pi.registerMessageRenderer<WorkflowResultDetails>(WORKFLOW_RESULT_TYPE, (message, options, theme) => {
+		const d = message.details;
+		if (!d) return undefined;
+		const text = typeof message.content === "string" ? message.content : extractText(message.content);
+		const glyph = d.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+		const stats: string[] = [];
+		if (d.agents !== undefined) stats.push(`${d.agents} agent${d.agents === 1 ? "" : "s"}`);
+		if (d.tokens) stats.push(`${formatTokens(d.tokens)} tokens`);
+		if (d.durationMs !== undefined) stats.push(formatDuration(d.durationMs));
+		const suffix = stats.length ? theme.fg("dim", ` · ${stats.join(" · ")}`) : "";
+		const c = new Container();
+		c.addChild(new TruncatedText(`${glyph} ${theme.fg("toolTitle", theme.bold("workflow"))} ${d.name}${suffix}`, 0, 0));
+		// The headline paragraph repeats the row above; show the return value.
+		const paragraphBreak = text.indexOf("\n\n");
+		const body = (paragraphBreak === -1 ? text : text.slice(paragraphBreak + 2)).trim();
+		if (body) {
+			const lines = body.split("\n");
+			const shown = options.expanded ? lines : lines.filter((l) => l.trim()).slice(0, 6);
+			for (const line of shown) {
+				c.addChild(new TruncatedText(`   ${d.ok ? theme.fg("dim", line) : theme.fg("error", line)}`, 0, 0));
+			}
+			if (!options.expanded && lines.length > shown.length) {
+				c.addChild(new TruncatedText(theme.fg("dim", `   … ${lines.length - shown.length} more lines (ctrl+o expands)`), 0, 0));
+			}
+		}
+		return c;
+	});
+
 	interface TeammateMessageDetails {
 		name: string;
 		agentType: string;
@@ -2976,6 +3775,9 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		tokens: number;
 		durationMs: number;
 		failed: boolean;
+		unverified?: boolean;
+		stalled?: boolean;
+		needsInput?: boolean;
 		requestsShutdown?: boolean;
 	}
 
@@ -2983,9 +3785,11 @@ Resume: pass resume_from_run_id with a prior run ID — agent() calls whose prom
 		const d = message.details;
 		if (!d) return undefined;
 		const text = typeof message.content === "string" ? message.content : extractText(message.content);
-		const glyph = d.failed ? theme.fg("error", "✗") : theme.fg("accent", "●");
+		const glyph = d.failed ? theme.fg("error", "✗") : d.needsInput ? theme.fg("warning", "✻") : theme.fg("accent", "●");
 		const shutdownBadge = d.requestsShutdown ? theme.fg("warning", " · requests shutdown") : "";
-		const suffix = `${statsSuffix(theme, d.toolCount, d.tokens)}${theme.fg("dim", ` · ${formatDuration(d.durationMs)}`)}${shutdownBadge}`;
+		const unverifiedBadge = d.unverified ? theme.fg("error", " · unverified (no tool calls)") : "";
+		const stalledBadge = d.stalled ? theme.fg("warning", " · stalled · partial") : "";
+		const suffix = `${statsSuffix(theme, d.toolCount, d.tokens)}${theme.fg("dim", ` · ${formatDuration(d.durationMs)}`)}${unverifiedBadge}${stalledBadge}${shutdownBadge}`;
 		const c = new Container();
 		c.addChild(new TruncatedText(`${glyph} ${typeLabel(theme, `@${d.name}`, d.color)} ${theme.fg("dim", `(${d.agentType})`)}${suffix}`, 0, 0));
 		const paragraphBreak = text.indexOf("\n\n");
