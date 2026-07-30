@@ -969,8 +969,24 @@ function syncWidgetTicker(): void {
 	widgetTicker.unref?.();
 }
 
+/**
+ * Every ctx member throws once pi has replaced the session (newSession, fork,
+ * switchSession, reload). Children outlive that replacement and keep emitting
+ * progress, so anything holding a captured ctx has to probe before touching it
+ * — the callbacks run inside rpc stream handlers, where a throw is an uncaught
+ * exception that kills the parent rather than a tool error.
+ */
+function ctxAlive(ctx: ExtensionContext): boolean {
+	try {
+		void ctx.hasUI;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function updateWidget(ctx: ExtensionContext): void {
-	if (!ctx.hasUI) return;
+	if (!ctxAlive(ctx) || !ctx.hasUI) return;
 	if (sessions.size === 0) {
 		browseIndex = null;
 		stopWidgetTicker();
@@ -1005,7 +1021,7 @@ function updateWidget(ctx: ExtensionContext): void {
 
 /** Transcript tail of the browsed agent, rendered above the editor. */
 function updatePreviewWidget(ctx: ExtensionContext, selected: AgentSession | undefined): void {
-	if (!ctx.hasUI) return;
+	if (!ctxAlive(ctx) || !ctx.hasUI) return;
 	if (!selected) {
 		ctx.ui.setWidget(PREVIEW_WIDGET_KEY, undefined);
 		return;
@@ -1285,7 +1301,7 @@ class RpcChild {
 			this.buf += chunk.toString("utf-8");
 			const lines = this.buf.split("\n");
 			this.buf = lines.pop() ?? "";
-			for (const line of lines) this.processLine(line);
+			for (const line of lines) this.safeProcessLine(line);
 		});
 		this.proc.stderr?.on("data", (chunk: Buffer) => {
 			this.stderrTail = (this.stderrTail + chunk.toString("utf-8")).slice(-2000);
@@ -1297,9 +1313,24 @@ class RpcChild {
 			this.settleOnExit(`Failed to spawn pi: ${err.message}`);
 		});
 		this.proc.on("close", (code) => {
-			if (this.buf.trim()) this.processLine(this.buf);
+			if (this.buf.trim()) this.safeProcessLine(this.buf);
 			this.settleOnExit(undefined, code ?? 1);
 		});
+	}
+
+	/**
+	 * processLine dispatches into parent callbacks (widgets, ctx, UI). It runs
+	 * inside a stream event handler, so anything that escapes it is an uncaught
+	 * exception that takes pi down and kills every other running agent with it.
+	 * A broken callback must cost at most one dropped event.
+	 */
+	private safeProcessLine(line: string): void {
+		try {
+			this.processLine(line);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			this.stderrTail = `${this.stderrTail}\n[claude-subagent] dropped rpc event: ${msg}`.slice(-2000);
+		}
 	}
 
 	/** Send one user message and resolve when its run completes. Never rejects. */
@@ -1696,9 +1727,10 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 					updateWidget(opts.ctx);
 				},
 				onUiRequest: (req) => {
-					if (!opts.ctx.hasUI) {
-						// Headless parent: nobody can answer; unblock the child
-						// immediately rather than letting it wait forever.
+					if (!ctxAlive(opts.ctx) || !opts.ctx.hasUI) {
+						// Headless parent, or one whose session has been replaced:
+						// nobody can answer; unblock the child immediately rather
+						// than letting it wait forever.
 						session.child.respondUi(req.id, { cancelled: true });
 						return;
 					}
