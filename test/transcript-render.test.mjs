@@ -10,7 +10,7 @@ const t = suite("transcript rendering");
 
 // Re-export the module-scope helpers so they can be imported directly; they are
 // internal to the extension otherwise.
-const out = fs.mkdtempSync(path.join(os.tmpdir(), "claude-subagent-render-"));
+const out = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-render-"));
 const modPath = path.join(out, "index.mjs");
 fs.writeFileSync(modPath, `${extensionJs()}\nexport { buildTranscriptComponents, transcriptLines };\n`);
 // Resolve bare imports against the package's own node_modules.
@@ -29,7 +29,7 @@ const { visibleWidth } = await import("@earendil-works/pi-tui");
 const tui = { terminal: { columns: 100, rows: 40 }, requestRender() {} };
 const opts = { tui, cwd: process.cwd() };
 
-const teammatesDir = path.join(os.homedir(), ".claude-subagent", "teammates");
+const teammatesDir = path.join(os.homedir(), ".pi-subagents", "teammates");
 const candidates = fs.existsSync(teammatesDir)
 	? fs
 			.readdirSync(teammatesDir)

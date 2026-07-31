@@ -15,7 +15,7 @@ let cached;
 /** Transpile index.ts once per run and return the emitted JavaScript. */
 export function extensionJs() {
 	if (cached) return cached;
-	const out = fs.mkdtempSync(path.join(os.tmpdir(), "claude-subagent-test-"));
+	const out = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
 	const tsc = path.join(ROOT, "node_modules/.bin/tsc");
 	const res = spawnSync(
 		tsc,

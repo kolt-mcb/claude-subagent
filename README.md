@@ -1,4 +1,4 @@
-# claude-subagent
+# pi-subagents
 
 A Claude Code–style **Agent (Task) tool** for [pi](https://pi.dev), the interactive CLI coding agent. It lets a pi session spawn purpose-built subagents — one-shot helpers, long-lived named teammates, and background workers — plus a deterministic multi-agent **workflow** runner.
 
@@ -52,7 +52,7 @@ Each is a markdown file with frontmatter (`name`, `description`, `tools`, `model
 This is a pi extension — a single `index.ts`. Point pi at it:
 
 ```bash
-pi -e /path/to/claude-subagent/index.ts
+pi -e /path/to/pi-subagents/index.ts
 ```
 
 or add it to your pi extension config (see `package.json`'s `pi.extensions`).

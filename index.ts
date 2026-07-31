@@ -1,7 +1,8 @@
 /**
- * claude-subagent — a Claude Code–style Agent (Task) tool for pi.
+ * pi-subagents — a Claude Code–style Agent (Task) tool for pi.
  *
- * Philosophy (mirrors Claude Code, not pi-subagents):
+ * Philosophy (mirrors Claude Code, not nicobailon/pi-subagents, whose name this
+ * project took over — the contrast below is with that project, not itself):
  * - Subagents run with a minimal purpose-built system prompt: base + agent
  *   definition + notes + environment. They do NOT inherit the parent's system
  *   prompt, project context, skills, or conversation history.
@@ -70,9 +71,9 @@ const PREVIEW_MAX_ROWS = 16;
 const RESULT_MESSAGE_TYPE = "agent-result";
 const TEAMMATE_MESSAGE_TYPE = "teammate-message";
 const RECENT_TOOLS_LIMIT = 5;
-const SESSIONS_DIR = path.join(os.homedir(), ".claude-subagent", "sessions");
-const TEAMMATES_DIR = path.join(os.homedir(), ".claude-subagent", "teammates");
-const ASK_USER_TOOL_PATH = path.join(os.homedir(), ".claude-subagent", "ask-user-tool.js");
+const SESSIONS_DIR = path.join(os.homedir(), ".pi-subagents", "sessions");
+const TEAMMATES_DIR = path.join(os.homedir(), ".pi-subagents", "teammates");
+const ASK_USER_TOOL_PATH = path.join(os.homedir(), ".pi-subagents", "ask-user-tool.js");
 /** How long a finished background session stays alive (and message-able) before reaping. */
 const DONE_SESSION_GRACE_MS = 5 * 60 * 1000;
 const SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -457,7 +458,7 @@ function ensureAskUserTool(): string {
  * parent reads the call's args off the child's tool_execution_start event;
  * terminate ends the run as soon as the result is submitted.
  */
-const STRUCTURED_OUTPUT_TOOL_PATH = path.join(os.homedir(), ".claude-subagent", "structured-output-tool.js");
+const STRUCTURED_OUTPUT_TOOL_PATH = path.join(os.homedir(), ".pi-subagents", "structured-output-tool.js");
 const STRUCTURED_OUTPUT_TOOL_SOURCE = `export default function structuredOutput(pi) {
 	pi.registerTool({
 		name: "structured_output",
@@ -1329,7 +1330,7 @@ class RpcChild {
 			this.processLine(line);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			this.stderrTail = `${this.stderrTail}\n[claude-subagent] dropped rpc event: ${msg}`.slice(-2000);
+			this.stderrTail = `${this.stderrTail}\n[pi-subagents] dropped rpc event: ${msg}`.slice(-2000);
 		}
 	}
 
@@ -1895,7 +1896,7 @@ export default function claudeSubagent(pi: ExtensionAPI): void {
 		};
 	}
 
-	// Smart join (after pi-subagents): background reports landing close
+	// Smart join (borrowed from nicobailon/pi-subagents): background reports landing close
 	// together deliver as one batch — each report stays its own rendered
 	// message, but only the last triggers a model turn, so N completions cost
 	// one wake-up instead of N. A report flushes immediately when no other
@@ -2506,7 +2507,7 @@ Usage notes:
 	// ─── Workflows: deterministic multi-agent orchestration scripts ───
 
 	const WORKFLOW_RESULT_TYPE = "workflow-result";
-	const WORKFLOWS_DIR = path.join(os.homedir(), ".claude-subagent", "workflows");
+	const WORKFLOWS_DIR = path.join(os.homedir(), ".pi-subagents", "workflows");
 	const WORKFLOW_AGENT_CAP = 50;
 
 	interface WorkflowJournalEntry {

@@ -10,7 +10,7 @@ import * as path from "node:path";
 import * as vm from "node:vm";
 import { evalSlice, suite } from "./harness.mjs";
 
-const bin = fs.mkdtempSync(path.join(os.tmpdir(), "claude-subagent-stub-"));
+const bin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-stub-"));
 fs.writeFileSync(
 	path.join(bin, "pi"),
 	`#!/usr/bin/env node

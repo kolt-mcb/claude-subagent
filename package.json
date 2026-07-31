@@ -1,5 +1,5 @@
 {
-	"name": "claude-subagent",
+	"name": "pi-subagents",
 	"version": "0.1.0",
 	"description": "Claude Code-style Agent (Task) tool for pi: minimal purpose-built subagent prompts, fresh context, no nesting.",
 	"type": "module",

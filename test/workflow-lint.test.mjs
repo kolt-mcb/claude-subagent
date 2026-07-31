@@ -117,7 +117,7 @@ t.check(
 
 // Regression corpus: every workflow script this install has ever run. Only
 // genuinely broken ones may be blocked.
-const dir = path.join(os.homedir(), ".claude-subagent", "workflows");
+const dir = path.join(os.homedir(), ".pi-subagents", "workflows");
 if (fs.existsSync(dir)) {
 	const files = fs.readdirSync(dir).filter((f) => f.endsWith(".mjs"));
 	// The sandbox globals a workflow script may reference without declaring
